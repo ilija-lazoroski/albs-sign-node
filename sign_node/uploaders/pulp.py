@@ -8,6 +8,9 @@ import typing
 from typing import List
 
 from fsplit.filesplit import Filesplit
+from pulpcore.client.pulp_rpm import ApiClient as RpmApiClient
+from pulpcore.client.pulp_rpm import Configuration as RpmConfiguration
+from pulpcore.client.pulp_rpm import ContentPackagesApi, RpmPackageResponse
 from pulpcore.client.pulpcore.configuration import Configuration
 from pulpcore.client.pulpcore.api_client import ApiClient
 from pulpcore.client.pulpcore.api.tasks_api import TasksApi
@@ -233,6 +236,77 @@ class PulpBaseUploader(BaseUploader):
 
 
 class PulpRpmUploader(PulpBaseUploader):
+    def __init__(
+        self, host: str, username: str, password: str, chunk_size: int
+    ):
+        super().__init__(host, username, password, chunk_size)
+        rpm_api_client = RpmApiClient(
+            configuration=RpmConfiguration(
+                host=host, username=username, password=password
+            )
+        )
+        self._packages_client = ContentPackagesApi(api_client=rpm_api_client)
+
+    def _send_rpm(self, file_path: str, file_sha256: str) -> str:
+        """
+        Creates RPM content with the synchronous upload endpoint, so no
+        Pulp tasks have to be queued and polled.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to the RPM file.
+        file_sha256 : str
+            Pre-computed SHA256 of the file.
+
+        Returns
+        -------
+        str
+            Reference to the RPM package.
+
+        """
+        if os.path.getsize(file_path) > self._chunk_size:
+            package = self._post_rpm_chunked(file_path)
+        else:
+            package = self._packages_client.upload(file=file_path)
+
+        if package.sha256 != file_sha256:
+            raise UploadError(
+                f"{file_path} checksum mismatch: expected {file_sha256}, "
+                f"Pulp has {package.sha256}"
+            )
+        return package.pulp_href
+
+    def _post_rpm_chunked(self, file_path: str) -> RpmPackageResponse:
+        """
+        Uploads a large RPM in chunks and creates the package from
+        the resulting upload.
+
+        Parameters
+        ----------
+        file_path: str
+            Path to the RPM file
+        """
+        upload_href, _ = self._create_upload(file_path)
+        try:
+            self._put_large_file(file_path, upload_href)
+            return self._packages_client.upload(upload=upload_href)
+        finally:
+            # Unlike the commit task, the synchronous endpoint keeps
+            # the upload and its chunks, so remove them ourselves
+            try:
+                self._uploads_client.delete(upload_href)
+            except Exception as e:
+                self._logger.warning(
+                    "Cannot delete upload %s: %s", upload_href, e
+                )
+
+    def _send_file(self, file_path: str) -> tuple[str, str]:
+        if not file_path.endswith(".rpm"):
+            return super()._send_file(file_path)
+        file_sha256 = hash_file(file_path, hash_type="sha256")
+        return file_sha256, self._send_rpm(file_path, file_sha256)
+
     def get_artifacts_list(self, artifacts_dir: str) -> List[str]:
         """
 
