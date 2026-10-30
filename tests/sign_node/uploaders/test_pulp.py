@@ -2,6 +2,8 @@ import operator
 import os
 from unittest.mock import Mock, patch
 
+from pulpcore.client.pulp_rpm.exceptions import ApiException as RpmApiException
+from pulpcore.client.pulpcore.exceptions import ApiException
 from pyfakefs.fake_filesystem_unittest import TestCase
 
 from sign_node.models import Artifact
@@ -14,6 +16,11 @@ class TestPulpRpmUploader(TestCase):
 
     def setUp(self):
         self.setUpPyfakefs()
+        session_patcher = patch('sign_node.uploaders.pulp.PulpSession')
+        self.session = session_patcher.start().return_value
+        self.addCleanup(session_patcher.stop)
+        # authenticate() must return the client it was given
+        self.session.authenticate.side_effect = lambda client: client
 
         self.fs.create_dir('/build_dir/tmp')
 
@@ -22,7 +29,7 @@ class TestPulpRpmUploader(TestCase):
         self.file_paths = sorted([
             '/build_dir/package.rpm',
             '/build_dir/build.log',
-            '/build_dir/config.cfg'
+            '/build_dir/config.cfg',
         ])
 
         for file_path in self.file_paths:
@@ -101,6 +108,7 @@ class TestPulpRpmUploader(TestCase):
 
         class TasksApi:
             TASK_HREF = 'task1'
+
             def __init__(self, *_, **__):
                 pass
 
@@ -114,7 +122,9 @@ class TestPulpRpmUploader(TestCase):
         with (
             patch('sign_node.uploaders.pulp.UploadsApi', new=UploadsApi),
             patch('sign_node.uploaders.pulp.TasksApi', new=TasksApi),
-            patch.object(PulpRpmUploader, 'check_if_artifact_exists', return_value=None)
+            patch.object(
+                PulpRpmUploader, 'check_if_artifact_exists', return_value=None
+            ),
         ):
             uploader = PulpRpmUploader('localhost', 'user', 'password', f_size)
             file_sha256, artifact_href = uploader._send_file(f_path)
@@ -326,3 +336,56 @@ class TestPulpRpmUploader(TestCase):
             assert file_sha256 == f_hash
             assert package_href == f_href
             assert any(upload_href in line for line in logs.output)
+
+    def test_upload_relogins_on_expired_session(self):
+        uploader = PulpRpmUploader('localhost', 'user', 'password', 42)
+        # Each SDK raises its own ApiException, both must trigger a re-login
+        for error in (ApiException(status=401), RpmApiException(status=403)):
+            with self.subTest(error=type(error).__module__):
+                self.session.login.reset_mock()
+                with patch.object(
+                    PulpRpmUploader,
+                    '_send_file',
+                    side_effect=[error, ('sha256', 'href')],
+                ) as send_file:
+                    artifact = uploader.upload_single_file(
+                        '/build_dir/package.rpm'
+                    )
+                assert artifact.href == 'href'
+                assert send_file.call_count == 2
+                self.session.login.assert_called_once()
+
+    def test_upload_does_not_relogin_on_other_errors(self):
+        uploader = PulpRpmUploader('localhost', 'user', 'password', 42)
+        with patch.object(
+            PulpRpmUploader,
+            '_send_file',
+            side_effect=ApiException(status=500),
+        ) as send_file:
+            with self.assertRaises(ApiException):
+                uploader.upload_single_file('/build_dir/package.rpm')
+        send_file.assert_called_once()
+        self.session.login.assert_not_called()
+
+    def test_upload_relogins_only_once(self):
+        uploader = PulpRpmUploader('localhost', 'user', 'password', 42)
+        with patch.object(
+            PulpRpmUploader,
+            '_send_file',
+            side_effect=[ApiException(status=401), ApiException(status=401)],
+        ) as send_file:
+            with self.assertRaises(ApiException):
+                uploader.upload_single_file('/build_dir/package.rpm')
+        assert send_file.call_count == 2
+        self.session.login.assert_called_once()
+
+    def test_clients_use_the_session(self):
+        uploader = PulpRpmUploader('localhost', 'user', 'password', 42)
+        clients = [c.args[0] for c in self.session.authenticate.call_args_list]
+        # The pulpcore client and the pulp_rpm client
+        assert len(clients) == 2
+        assert uploader._packages_client.api_client is clients[1]
+        for client in clients:
+            # No credentials, so the SDK sends no Basic auth
+            assert client.configuration.username is None
+            assert client.configuration.password is None

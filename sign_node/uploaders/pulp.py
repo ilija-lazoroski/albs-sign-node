@@ -11,16 +11,18 @@ from fsplit.filesplit import Filesplit
 from pulpcore.client.pulp_rpm import ApiClient as RpmApiClient
 from pulpcore.client.pulp_rpm import Configuration as RpmConfiguration
 from pulpcore.client.pulp_rpm import ContentPackagesApi, RpmPackageResponse
+from pulpcore.client.pulp_rpm.exceptions import ApiException as RpmApiException
 from pulpcore.client.pulpcore.configuration import Configuration
 from pulpcore.client.pulpcore.api_client import ApiClient
+from pulpcore.client.pulpcore.exceptions import ApiException
 from pulpcore.client.pulpcore.api.tasks_api import TasksApi
 from pulpcore.client.pulpcore.api.uploads_api import UploadsApi
 from pulpcore.client.pulpcore.api.artifacts_api import ArtifactsApi
 
 from sign_node.uploaders.base import BaseUploader, UploadError
+from sign_node.uploaders.pulp_session import PulpSession
 from sign_node.utils.file_utils import hash_file
 from sign_node.models import Artifact
-
 
 __all__ = ["PulpBaseUploader", "PulpRpmUploader"]
 
@@ -34,7 +36,9 @@ class PulpBaseUploader(BaseUploader):
     Handles uploads to Pulp server.
     """
 
-    def __init__(self, host: str, username: str, password: str, chunk_size: int):
+    def __init__(
+        self, host: str, username: str, password: str, chunk_size: int
+    ):
         """
         Initiate uploader.
 
@@ -49,7 +53,8 @@ class PulpBaseUploader(BaseUploader):
         chunk_size : int
             Size of chunk to split files during the upload.
         """
-        api_client = self._prepare_api_client(host, username, password)
+        self._session = PulpSession(host, username, password)
+        api_client = self._prepare_api_client(host)
         self._uploads_client = UploadsApi(api_client=api_client)
         self._tasks_client = TasksApi(api_client=api_client)
         self._artifacts_client = ArtifactsApi(api_client=api_client)
@@ -57,25 +62,23 @@ class PulpBaseUploader(BaseUploader):
         self._chunk_size = chunk_size
         self._logger = logging.getLogger(__file__)
 
-    @staticmethod
-    def _prepare_api_client(host: str, username: str, password: str) -> ApiClient:
+    def _prepare_api_client(self, host: str) -> ApiClient:
         """
 
         Parameters
         ----------
         host : str
-        username : str
-        password : str
 
         Returns
         -------
         ApiClient
 
         """
-        api_configuration = Configuration(
-            host=host, username=username, password=password
+        # No username/password, otherwise the client sends Basic auth
+        api_configuration = Configuration(host=host)
+        return self._session.authenticate(
+            ApiClient(configuration=api_configuration)
         )
-        return ApiClient(configuration=api_configuration)
 
     def _wait_for_task_completion(self, task_href: str) -> dict:
         """
@@ -97,10 +100,12 @@ class PulpBaseUploader(BaseUploader):
             delay = min(delay * 2, 5)
             result = self._tasks_client.read(task_href)
         if result.state == "failed":
-            raise TaskFailedError(f"task {task_href} has failed, " f"details: {result}")
+            raise TaskFailedError(
+                f"task {task_href} has failed, " f"details: {result}"
+            )
         return result
 
-    def _create_upload(self, file_path: str) -> (str, int):
+    def _create_upload(self, file_path: str) -> typing.Tuple[str, int]:
         """
 
         Parameters
@@ -136,7 +141,9 @@ class PulpBaseUploader(BaseUploader):
             Reference to the created resource.
 
         """
-        response = self._uploads_client.commit(reference, {"sha256": file_sha256})
+        response = self._uploads_client.commit(
+            reference, {"sha256": file_sha256}
+        )
         task_result = self._wait_for_task_completion(response.task)
         return task_result.created_resources[0]
 
@@ -145,15 +152,21 @@ class PulpBaseUploader(BaseUploader):
         try:
             lower_bytes_limit = 0
             total_size = os.path.getsize(file_path)
-            self._file_splitter.split(file_path, self._chunk_size, output_dir=temp_dir)
+            self._file_splitter.split(
+                file_path, self._chunk_size, output_dir=temp_dir
+            )
             manifest_path = os.path.join(temp_dir, 'fs_manifest.csv')
             for meta in csv.DictReader(open(manifest_path, 'r')):
                 split_file_path = os.path.join(temp_dir, meta['filename'])
-                upper_bytes_limit = lower_bytes_limit + int(meta['filesize']) - 1
+                upper_bytes_limit = (
+                    lower_bytes_limit + int(meta['filesize']) - 1
+                )
                 self._uploads_client.update(
                     f'bytes {lower_bytes_limit}-{upper_bytes_limit}/'
                     f'{total_size}',
-                    reference, split_file_path)
+                    reference,
+                    split_file_path,
+                )
                 lower_bytes_limit += int(meta['filesize'])
         finally:
             if temp_dir and os.path.exists(temp_dir):
@@ -199,7 +212,9 @@ class PulpBaseUploader(BaseUploader):
             try:
                 artifacts.append(self.upload_single_file(artifact))
             except Exception as e:
-                self._logger.error("Cannot upload %s, error: %s", artifact, e, exc_info=e)
+                self._logger.error(
+                    "Cannot upload %s, error: %s", artifact, e, exc_info=e
+                )
                 errored_uploads.append(artifact)
         # TODO: Decide what to do with successfully uploaded artifacts
         #  in case of errors during upload.
@@ -208,8 +223,9 @@ class PulpBaseUploader(BaseUploader):
         return artifacts
 
     def upload_single_file(
-            self, filename: str,
-            artifact_type: typing.Optional[str] = None,
+        self,
+        filename: str,
+        artifact_type: typing.Optional[str] = None,
     ) -> Artifact:
         """
 
@@ -224,7 +240,15 @@ class PulpBaseUploader(BaseUploader):
         -------
         Artifact
         """
-        file_sha256, reference = self._send_file(filename)
+        try:
+            file_sha256, reference = self._send_file(filename)
+        except (ApiException, RpmApiException) as e:
+            if e.status not in (401, 403):
+                raise
+            # The session has expired (after 2 weeks by default),
+            # log in again and retry once
+            self._session.login()
+            file_sha256, reference = self._send_file(filename)
         if artifact_type is None:
             artifact_type = 'rpm' if filename.endswith('.rpm') else 'build_log'
         return Artifact(
@@ -240,10 +264,8 @@ class PulpRpmUploader(PulpBaseUploader):
         self, host: str, username: str, password: str, chunk_size: int
     ):
         super().__init__(host, username, password, chunk_size)
-        rpm_api_client = RpmApiClient(
-            configuration=RpmConfiguration(
-                host=host, username=username, password=password
-            )
+        rpm_api_client = self._session.authenticate(
+            RpmApiClient(configuration=RpmConfiguration(host=host))
         )
         self._packages_client = ContentPackagesApi(api_client=rpm_api_client)
 
